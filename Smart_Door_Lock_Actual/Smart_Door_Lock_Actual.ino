@@ -1,91 +1,158 @@
-// ESP32 Li-Fi Smart Door Lock with LDR and Relay
-#include <Arduino.h>
+#include "config.h"
+#include "pattern_manager.h"
+#include "security.h"
+#include "user_manager.h"
 
-// Pin definitions
-#define LDR_PIN 34    // Analog pin for LDR
-#define RELAY_PIN 4   // GPIO pin for relay
-#define UNLOCK_DURATION 5000  // Duration to keep door unlocked (ms)
-
-// Light pattern settings
-#define PATTERN_LENGTH 5  // Number of light states in the pattern
-#define THRESHOLD 2000    // Analog threshold for light detection (adjust based on LDR)
-#define TIMEOUT 1000      // Timeout for each pattern step (ms)
-
-// Define the expected light pattern (1 = light ON, 0 = light OFF)
-int expectedPattern[PATTERN_LENGTH] = {1, 0, 1, 0, 1};  // Example: ON-OFF-ON-OFF-ON
-
-// Variables
-int detectedPattern[PATTERN_LENGTH];
+// Global variables
 unsigned long lastTime = 0;
 bool relayActive = false;
+unsigned long lastPatternCheck = 0;
 
 void setup() {
-  // Initialize serial communication for debugging
   Serial.begin(115200);
-
+  
   // Initialize pins
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);  // Relay OFF (active LOW)
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  pinMode(ENROLLMENT_BUTTON_PIN, INPUT_PULLUP);
   pinMode(LDR_PIN, INPUT);
-
-  Serial.println("ESP32 Li-Fi Smart Door Lock Initialized");
+  
+  // Initialize relay (locked state)
+  digitalWrite(RELAY_PIN, HIGH);
+  
+  // Initialize managers
+  userManager.initializeDatabase();
+  
+  Serial.println("ESP32 Li-Fi Enhanced Smart Door Lock Initialized");
+  Serial.printf("System supports up to %d users\n", MAX_USERS);
+  Serial.printf("Current enrolled users: %d\n", userManager.getUserCount());
+  Serial.println("Hold enrollment button for 5 seconds to enter enrollment mode");
 }
 
-bool readLightState() {
-  int ldrValue = analogRead(LDR_PIN);  // Read LDR analog value (0-4095)
-  Serial.print("LDR Value: ");
-  Serial.println(ldrValue);
-  return ldrValue > THRESHOLD;  // Return true if light is ON, false if OFF
-}
-
-bool checkPattern() {
-  // Read the light pattern
-  for (int i = 0; i < PATTERN_LENGTH; i++) {
-    unsigned long startTime = millis();
-    bool currentState = readLightState();
-    detectedPattern[i] = currentState ? 1 : 0;
-
-    Serial.print("Detected State ");
-    Serial.print(i);
-    Serial.print(": ");
-    Serial.println(detectedPattern[i]);
-
-    // Wait for the next pattern step or timeout
-    while (millis() - startTime < TIMEOUT) {
-      if (readLightState() != currentState) {
-        break;  // State changed, move to next step
+void handleEnrollmentMode() {
+  static bool waitingForPattern = true;
+  static int enrollmentAttempts = 0;
+  static String capturedPatterns[3]; // Require 3 consecutive matches
+  
+  if (waitingForPattern) {
+    Serial.println("Enrollment mode active - transmit your pattern 3 times");
+    waitingForPattern = false;
+  }
+  
+  // Check for light pattern
+  String pattern = patternManager.capturePattern();
+  if (pattern.length() > 0) {
+    capturedPatterns[enrollmentAttempts] = pattern;
+    enrollmentAttempts++;
+    
+    Serial.printf("Enrollment attempt %d/3 captured\n", enrollmentAttempts);
+    
+    if (enrollmentAttempts >= 3) {
+      // Verify all 3 patterns match
+      if (capturedPatterns[0] == capturedPatterns[1] && 
+          capturedPatterns[1] == capturedPatterns[2]) {
+        
+        // Generate hash and store user
+        String patternHash = securityManager.generateHash(pattern);
+        int userId = userManager.addUser(patternHash.c_str(), 1); // Default user level
+        
+        if (userId > 0) {
+          Serial.printf("User enrolled successfully with ID: %d\n", userId);
+          // Flash LED to indicate success
+          for (int i = 0; i < 6; i++) {
+            digitalWrite(STATUS_LED_PIN, i % 2);
+            delay(200);
+          }
+        } else {
+          Serial.println("Enrollment failed - database full");
+        }
+      } else {
+        Serial.println("Pattern mismatch - enrollment failed");
       }
-      delay(10);
+      
+      // Reset enrollment
+      enrollmentAttempts = 0;
+      waitingForPattern = true;
+      patternManager.exitEnrollmentMode();
     }
-    delay(100);  // Small delay between steps
+    
+    delay(1000); // Delay between enrollment attempts
   }
+}
 
-  // Compare detected pattern with expected pattern
-  for (int i = 0; i < PATTERN_LENGTH; i++) {
-    if (detectedPattern[i] != expectedPattern[i]) {
-      return false;  // Pattern mismatch
+void handleAuthenticationMode() {
+  // Check for light pattern every 500ms to avoid excessive processing
+  if (millis() - lastPatternCheck > 500) {
+    String pattern = patternManager.capturePattern();
+    
+    if (pattern.length() > 0) {
+      String patternHash = securityManager.generateHash(pattern);
+      
+      // Check against all enrolled users
+      bool accessGranted = false;
+      for (uint16_t userId = 1; userId <= userManager.getUserCount(); userId++) {
+        if (userManager.isValidUser(userId, patternHash.c_str())) {
+          if (securityManager.checkRateLimit()) {
+            Serial.printf("Access granted for User ID: %d\n", userId);
+            digitalWrite(RELAY_PIN, LOW);  // Unlock door
+            relayActive = true;
+            lastTime = millis();
+            accessGranted = true;
+            securityManager.resetFailedAttempts();
+            userManager.logAccess(userId, true);
+            break;
+          } else {
+            Serial.println("System locked out due to too many failed attempts");
+            userManager.logAccess(userId, false);
+          }
+        }
+      }
+      
+      if (!accessGranted && securityManager.checkRateLimit()) {
+        Serial.println("Invalid pattern detected");
+        securityManager.recordFailedAttempt();
+        userManager.logAccess(0, false); // Log failed attempt with userId 0
+      }
     }
+    
+    lastPatternCheck = millis();
   }
-  return true;  // Pattern matches
 }
 
 void loop() {
-  // Check if relay is active and time to lock the door
+  // Check enrollment button
+  patternManager.checkEnrollmentButton();
+  
+  // Update status LED
+  patternManager.updateStatusLED();
+  
+  // Handle door lock timing
   if (relayActive && millis() - lastTime > UNLOCK_DURATION) {
-    digitalWrite(RELAY_PIN, HIGH);  // Turn off relay (lock door)
+    digitalWrite(RELAY_PIN, HIGH);  // Lock door
     relayActive = false;
-    Serial.println("Door Locked");
+    Serial.println("Door locked automatically");
   }
-
-  // Check for light pattern
-  if (!relayActive && checkPattern()) {
-    Serial.println("Valid Light Pattern Detected - Unlocking Door");
-    digitalWrite(RELAY_PIN, LOW);  // Turn on relay (unlock door)
-    relayActive = true;
-    lastTime = millis();
-  } else if (!relayActive) {
-    Serial.println("Invalid or No Pattern Detected");
+  
+  // Handle different modes
+  switch (patternManager.getCurrentMode()) {
+    case MODE_ENROLLMENT:
+      handleEnrollmentMode();
+      break;
+      
+    case MODE_NORMAL:
+      if (!relayActive) {  // Only check for patterns when door is locked
+        handleAuthenticationMode();
+      }
+      break;
+      
+    case MODE_LOCKOUT:
+      // System locked out - just update security status
+      securityManager.updateSecurityStatus();
+      if (securityManager.checkRateLimit()) {
+        patternManager.setMode(MODE_NORMAL);
+      }
+      break;
   }
-
-  delay(500);  // Delay between checks
+  
+  delay(10); // Small delay to prevent excessive CPU usage
 }
